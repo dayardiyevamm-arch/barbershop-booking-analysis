@@ -1,0 +1,557 @@
+openapi: 3.0.3
+info:
+  title: BarberBook API
+  description: |
+    REST API сервиса онлайн-записи в барбершоп.
+
+    Поддерживает полный цикл управления записью: создание, просмотр, отмена, перенос.
+
+    **Авторизация:** JWT Bearer token.
+    **Часовой пояс:** все `timestamp` — в UTC (ISO 8601).
+  version: "1.0.0"
+  contact:
+    name: Madina Dayardiyeva
+    email: dayardiyevamm@gmail.com
+
+servers:
+  - url: https://api.barberbook.kz/v1
+    description: Production
+  - url: https://staging.api.barberbook.kz/v1
+    description: Staging
+
+tags:
+  - name: Slots
+    description: Просмотр свободных слотов
+  - name: Bookings
+    description: Управление записями клиента
+  - name: Catalog
+    description: Справочники (филиалы, мастера, услуги)
+
+security:
+  - bearerAuth: []
+
+paths:
+  /slots:
+    get:
+      tags: [Slots]
+      summary: Получить свободные слоты
+      description: Возвращает свободные слоты у мастеров на выбранную дату с учётом длительности услуги.
+      parameters:
+        - name: branch_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: ID филиала
+        - name: service_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: ID услуги (определяет длительность слота)
+        - name: master_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: Фильтр по мастеру. Если не указан — все мастера филиала.
+        - name: date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+          description: Дата в часовом поясе филиала (YYYY-MM-DD)
+          example: "2026-04-24"
+      responses:
+        '200':
+          description: Список свободных слотов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SlotsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Филиал или услуга не найдены
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /bookings:
+    get:
+      tags: [Bookings]
+      summary: Список моих записей
+      description: Возвращает записи текущего авторизованного клиента с фильтрацией по статусу.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [upcoming, past, cancelled]
+          description: Фильтр по категории
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Список записей
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Bookings]
+      summary: Создать запись (забронировать слот)
+      description: |
+        Создаёт новую запись на указанный слот.
+
+        **Возможные бизнес-ошибки:**
+        - `SLOT_ALREADY_TAKEN` (409) — слот занят другим клиентом
+        - `BOOKING_OVERLAP` (409) — у клиента уже есть запись в это время
+        - `BOOKING_IN_PAST` (422) — время в прошлом
+        - `SLOT_OUTSIDE_WORKING_HOURS` (422) — вне рабочих часов филиала
+        - `SERVICE_UNAVAILABLE_FOR_MASTER` (422) — мастер не оказывает эту услугу
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+      responses:
+        '201':
+          description: Запись успешно создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/BusinessRuleViolation'
+
+  /bookings/{id}:
+    get:
+      tags: [Bookings]
+      summary: Получить запись по ID
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Детали записи
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingWithHistory'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /bookings/{id}/cancel:
+    patch:
+      tags: [Bookings]
+      summary: Отменить запись
+      description: |
+        Отменяет запись клиента.
+
+        **Правила:**
+        - Отменить можно только свою запись (иначе 403).
+        - Запись должна быть в статусе `CONFIRMED` (иначе 422 `INVALID_STATE`).
+        - До начала визита должно быть не менее 2 часов (иначе 422 `CANCELLATION_WINDOW_EXPIRED`).
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelBookingRequest'
+      responses:
+        '200':
+          description: Запись отменена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/BusinessRuleViolation'
+
+  /bookings/{id}/reschedule:
+    patch:
+      tags: [Bookings]
+      summary: Перенести запись
+      description: |
+        Переносит запись на другой свободный слот. ID записи сохраняется, история переноса фиксируется в `booking_history`.
+
+        **Правила:**
+        - Переносить можно только свою запись в статусе `CONFIRMED`.
+        - До начала визита — не менее 2 часов.
+        - Новый слот должен быть свободен.
+        - Поля `master_id` и `service_id` опциональны — если не переданы, остаются прежними.
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RescheduleBookingRequest'
+      responses:
+        '200':
+          description: Запись перенесена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/BusinessRuleViolation'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    BookingId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: ID записи
+
+  schemas:
+    # --- Запросы ---
+    CreateBookingRequest:
+      type: object
+      required: [branch_id, master_id, service_id, start_at]
+      properties:
+        branch_id:
+          type: string
+          format: uuid
+        master_id:
+          type: string
+          format: uuid
+        service_id:
+          type: string
+          format: uuid
+        start_at:
+          type: string
+          format: date-time
+          example: "2026-04-24T09:00:00Z"
+
+    CancelBookingRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+          description: Опциональная причина отмены
+          example: "Планы изменились"
+
+    RescheduleBookingRequest:
+      type: object
+      required: [new_start_at]
+      properties:
+        new_start_at:
+          type: string
+          format: date-time
+          example: "2026-04-25T11:00:00Z"
+        master_id:
+          type: string
+          format: uuid
+          description: Опционально — если меняется мастер
+        service_id:
+          type: string
+          format: uuid
+          description: Опционально — если меняется услуга
+
+    # --- Ответы ---
+    Slot:
+      type: object
+      properties:
+        master_id:
+          type: string
+          format: uuid
+        master_name:
+          type: string
+          example: "Алихан А."
+        start_at:
+          type: string
+          format: date-time
+        end_at:
+          type: string
+          format: date-time
+        price:
+          type: number
+          example: 5000
+
+    SlotsResponse:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        timezone:
+          type: string
+          example: "Asia/Almaty"
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Slot'
+
+    Booking:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "bk_9f3e1a2b"
+        status:
+          type: string
+          enum: [CONFIRMED, CANCELLED, COMPLETED, NO_SHOW]
+        client_id:
+          type: string
+          format: uuid
+        master_id:
+          type: string
+          format: uuid
+        master_name:
+          type: string
+        service_id:
+          type: string
+          format: uuid
+        service_name:
+          type: string
+        branch_id:
+          type: string
+          format: uuid
+        start_at:
+          type: string
+          format: date-time
+        end_at:
+          type: string
+          format: date-time
+        price:
+          type: number
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    BookingHistoryEntry:
+      type: object
+      properties:
+        event_type:
+          type: string
+          enum: [CREATED, RESCHEDULED, CANCELLED, STATUS_CHANGED]
+        old_value:
+          type: object
+          nullable: true
+        new_value:
+          type: object
+          nullable: true
+        changed_at:
+          type: string
+          format: date-time
+
+    BookingWithHistory:
+      allOf:
+        - $ref: '#/components/schemas/Booking'
+        - type: object
+          properties:
+            history:
+              type: array
+              items:
+                $ref: '#/components/schemas/BookingHistoryEntry'
+
+    BookingListResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+          example: 2
+        limit:
+          type: integer
+        offset:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Booking'
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: "SLOT_ALREADY_TAKEN"
+            message:
+              type: string
+              example: "Выбранный слот только что был забронирован другим клиентом"
+            details:
+              type: object
+              additionalProperties: true
+            request_id:
+              type: string
+              example: "req_abc123xyz"
+
+  responses:
+    BadRequest:
+      description: Невалидный запрос
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            validation:
+              value:
+                error:
+                  code: "VALIDATION_FAILED"
+                  message: "Поле start_at обязательно"
+                  request_id: "req_abc"
+
+    Unauthorized:
+      description: Требуется авторизация
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            unauth:
+              value:
+                error:
+                  code: "UNAUTHORIZED"
+                  message: "Токен истёк"
+                  request_id: "req_abc"
+
+    Forbidden:
+      description: Доступ запрещён
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            forbidden:
+              value:
+                error:
+                  code: "FORBIDDEN"
+                  message: "Нет доступа к этой записи"
+                  request_id: "req_abc"
+
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            not_found:
+              value:
+                error:
+                  code: "BOOKING_NOT_FOUND"
+                  message: "Запись не найдена"
+                  request_id: "req_abc"
+
+    Conflict:
+      description: Конфликт состояния
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            slot_taken:
+              value:
+                error:
+                  code: "SLOT_ALREADY_TAKEN"
+                  message: "Слот занят другим клиентом"
+                  details:
+                    slot_start_at: "2026-04-24T09:00:00Z"
+                    master_id: "m1..."
+                  request_id: "req_abc"
+            overlap:
+              value:
+                error:
+                  code: "BOOKING_OVERLAP"
+                  message: "У вас уже есть запись в это время"
+                  request_id: "req_abc"
+
+    BusinessRuleViolation:
+      description: Нарушение бизнес-правила
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            window_expired:
+              value:
+                error:
+                  code: "CANCELLATION_WINDOW_EXPIRED"
+                  message: "Отменить можно не позднее чем за 2 часа"
+                  details:
+                    booking_id: "bk_9f3e..."
+                    start_at: "2026-04-24T09:00:00Z"
+                    cancellation_deadline: "2026-04-24T07:00:00Z"
+                    current_time: "2026-04-24T08:15:00Z"
+                  request_id: "req_abc"
+            invalid_state:
+              value:
+                error:
+                  code: "INVALID_STATE"
+                  message: "Запись уже отменена"
+                  request_id: "req_abc"
+            in_past:
+              value:
+                error:
+                  code: "BOOKING_IN_PAST"
+                  message: "Нельзя записаться на прошедшее время"
+                  request_id: "req_abc"
